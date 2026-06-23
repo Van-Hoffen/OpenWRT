@@ -7,19 +7,21 @@ G='\033[0;32m'
 Y='\033[1;33m'
 R='\033[0;31m'
 N='\033[0m'
-msg() { echo -e "${G}[*]${N} $1"; }
+msg()  { echo -e "${G}[*]${N} $1"; }
 warn() { echo -e "${Y}[!]${N} $1"; }
-err() { echo -e "${R}[!] ERROR:${N} $1"; exit 1; }
+err()  { echo -e "${R}[!] ERROR:${N} $1"; exit 1; }
 
-# ─── Sanity checks ──────────────────────────────────────────────────────────
+# ─── Sanity checks ───────────────────────────────────────────────────────────
 [ "$(id -u)" -ne 0 ] && err "Must run as root."
 [ "$(uname -m)" != "x86_64" ] && err "Only x86_64 is supported."
 
+if systemd-detect-virt 2>/dev/null | grep -qiE "openvz|lxc"; then
+    err "OpenVZ/LXC is not supported. Use a KVM-based VPS."
+fi
+
 # ─── Random port generation ──────────────────────────────────────────────────
-# Диапазон: 10000–59999 (избегаем зарезервированных и распространённых портов)
 SSH_PORT=${SSH_PORT:-$(shuf -i 10000-59999 -n1)}
 LUCI_PORT=${LUCI_PORT:-$(shuf -i 10000-59999 -n1)}
-# Гарантируем что порты не совпадают
 while [ "$LUCI_PORT" -eq "$SSH_PORT" ]; do
     LUCI_PORT=$(shuf -i 10000-59999 -n1)
 done
@@ -63,52 +65,86 @@ msg "Interface : $ACTIVE_IF"
 msg "WAN IP    : $WAN_IP / $WAN_MASK"
 msg "Gateway   : $WAN_GW"
 
+# ─── Dependencies (до curl-запросов) ─────────────────────────────────────────
+msg "Installing dependencies..."
+apt-get update -y >/dev/null 2>&1
+apt-get install -y curl gzip util-linux fdisk initramfs-tools openssl kmod >/dev/null 2>&1
+
 # ─── Auto-detect latest OpenWRT stable version ───────────────────────────────
 msg "Detecting latest OpenWRT stable version..."
 
 OWRT_BASE="https://downloads.openwrt.org/releases"
 
-# Получаем список релизов, берём последний стабильный (без rc/beta)
-LATEST_VER=$(curl -fsSL "${OWRT_BASE}/" 2>/dev/null \
-    | grep -oP '(?<=href=")[\d]+\.[\d]+\.[\d]+(?=/)' \
+# Парсим листинг: ищем строки вида >25.12.4/<
+LATEST_VER=$(curl -sSL --connect-timeout 15 "${OWRT_BASE}/" 2>/dev/null \
+    | grep -oP '(?<=>)\d+\.\d+\.\d+(?=/)' \
     | sort -V \
     | tail -n1)
 
-[ -z "$LATEST_VER" ] && {
+if [ -z "$LATEST_VER" ]; then
     warn "Auto-detection failed, falling back to known latest: 25.12.4"
     LATEST_VER="25.12.4"
-}
-
-IMG_NAME="openwrt-${LATEST_VER}-x86-64-generic-ext4-combined.img.gz"
-IMG_URL="${OWRT_BASE}/${LATEST_VER}/targets/x86/64/${IMG_NAME}"
-
-# Проверяем доступность URL
-HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" --head "$IMG_URL" 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" != "200" ]; then
-    warn "URL not accessible (HTTP $HTTP_CODE): $IMG_URL"
-    # Fallback: пробуем с -efi суффиксом
-    IMG_NAME="openwrt-${LATEST_VER}-x86-64-generic-ext4-combined-efi.img.gz"
-    IMG_URL="${OWRT_BASE}/${LATEST_VER}/targets/x86/64/${IMG_NAME}"
-    HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" --head "$IMG_URL" 2>/dev/null || echo "000")
-    [ "$HTTP_CODE" != "200" ] && err "Cannot find image at ${OWRT_BASE}/${LATEST_VER}/targets/x86/64/"
 fi
 
-msg "OpenWRT version : $LATEST_VER"
-msg "Image URL       : $IMG_URL"
+msg "Detected OpenWRT version: $LATEST_VER"
 
-# ─── Dependencies ────────────────────────────────────────────────────────────
-msg "Installing dependencies..."
-apt-get update -y >/dev/null 2>&1
-apt-get install -y curl gzip util-linux fdisk initramfs-tools openssl kmod >/dev/null 2>&1
+# ─── Найти имя образа через sha256sums ───────────────────────────────────────
+TARGET_URL="${OWRT_BASE}/${LATEST_VER}/targets/x86/64"
+SHA256_URL="${TARGET_URL}/sha256sums"
+
+msg "Fetching file list from ${TARGET_URL}..."
+SHA256_LIST=$(curl -sSL --connect-timeout 15 "$SHA256_URL" 2>/dev/null)
+[ -z "$SHA256_LIST" ] && err "Cannot fetch sha256sums from ${SHA256_URL}"
+
+# Предпочитаем ext4-combined (не efi, не squashfs)
+IMG_NAME=$(echo "$SHA256_LIST" \
+    | grep -oP 'openwrt-[\d.]+-x86-64-generic-ext4-combined\.img\.gz' \
+    | head -n1)
+
+# Fallback: efi-вариант
+if [ -z "$IMG_NAME" ]; then
+    IMG_NAME=$(echo "$SHA256_LIST" \
+        | grep -oP 'openwrt-[\d.]+-x86-64-generic-ext4-combined-efi\.img\.gz' \
+        | head -n1)
+fi
+
+[ -z "$IMG_NAME" ] && err "Cannot find ext4-combined image in ${SHA256_URL}"
+
+IMG_URL="${TARGET_URL}/${IMG_NAME}"
+IMG_SHA256=$(echo "$SHA256_LIST" | grep "$IMG_NAME" | awk '{print $1}')
+
+msg "Image     : $IMG_NAME"
+msg "Image URL : $IMG_URL"
 
 # ─── Image Download ──────────────────────────────────────────────────────────
-msg "Downloading OpenWRT ${LATEST_VER} image (~13 MB)..."
+msg "Downloading OpenWRT ${LATEST_VER} image..."
 OWRT_TMP="/tmp/owrt.img"
 OWRT_GZ="/tmp/owrt.img.gz"
 
-curl -fSL --progress-bar "$IMG_URL" | gzip -dcq > "$OWRT_TMP" || true
-[ ! -s "$OWRT_TMP" ] && err "Image download failed or empty."
-msg "Image downloaded: $(du -sh "$OWRT_TMP" | cut -f1)"
+curl -L --progress-bar --connect-timeout 30 --retry 3 \
+    "$IMG_URL" -o "$OWRT_GZ" || err "Image download failed."
+
+[ ! -s "$OWRT_GZ" ] && err "Downloaded file is empty."
+msg "Downloaded: $(du -sh "$OWRT_GZ" | cut -f1)"
+
+# ─── SHA256 verification ─────────────────────────────────────────────────────
+if [ -n "$IMG_SHA256" ]; then
+    msg "Verifying SHA256..."
+    ACTUAL_SHA256=$(sha256sum "$OWRT_GZ" | awk '{print $1}')
+    if [ "$ACTUAL_SHA256" != "$IMG_SHA256" ]; then
+        rm -f "$OWRT_GZ"
+        err "SHA256 mismatch! Expected: $IMG_SHA256  Got: $ACTUAL_SHA256"
+    fi
+    msg "SHA256 OK."
+else
+    warn "SHA256 not verified (checksum not found in sha256sums)."
+fi
+
+# ─── Decompress image ────────────────────────────────────────────────────────
+msg "Decompressing image..."
+gzip -dcq "$OWRT_GZ" > "$OWRT_TMP" || err "Decompression failed."
+[ ! -s "$OWRT_TMP" ] && err "Decompressed image is empty."
+msg "Decompressed: $(du -sh "$OWRT_TMP" | cut -f1)"
 
 # ─── Patch rootfs ────────────────────────────────────────────────────────────
 msg "Patching rootfs..."
@@ -121,41 +157,39 @@ msg "Rootfs partition offset: $OFFSET bytes"
 
 MNT="/tmp/owrt_mod/rootfs"
 mkdir -p "$MNT"
-# Убедимся что точка монтирования чистая
 mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
 mount -o loop,offset="$OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs."
 
-# ── Генерация хеша пароля (SHA-512, совместим с OpenWRT/busybox) ──────────────
-# OpenWRT использует $6$ (SHA-512) в /etc/shadow
+# ── Хеш пароля SHA-512 (совместим с busybox/OpenWRT) ─────────────────────────
 PASS_SALT=$(openssl rand -hex 8)
 PASS_HASH=$(openssl passwd -6 -salt "$PASS_SALT" "$PASS_RAW")
 
-# ── UCI defaults: порты SSH, LuCI, firewall ───────────────────────────────────
+# ── UCI defaults ──────────────────────────────────────────────────────────────
 mkdir -p "$MNT/etc/uci-defaults"
 cat > "$MNT/etc/uci-defaults/99_vps_config" << EOF
 #!/bin/sh
 
-# ── SSH (dropbear) ──────────────────────────────────────────────────────────
+# SSH (dropbear)
 uci set dropbear.@dropbear[0].Port='${SSH_PORT}'
 uci set dropbear.@dropbear[0].PasswordAuth='on'
 uci set dropbear.@dropbear[0].RootPasswordAuth='on'
 uci commit dropbear
 
-# ── LuCI HTTP (uhttpd) ──────────────────────────────────────────────────────
+# LuCI HTTP (uhttpd)
 uci del uhttpd.main.listen_http  2>/dev/null || true
 uci del uhttpd.main.listen_https 2>/dev/null || true
 uci add_list uhttpd.main.listen_http='0.0.0.0:${LUCI_PORT}'
 uci add_list uhttpd.main.listen_http='[::]:${LUCI_PORT}'
 uci commit uhttpd
 
-# ── DNS ─────────────────────────────────────────────────────────────────────
+# DNS
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 
-# ── Disable dnsmasq (мешает на VPS без LAN) ──────────────────────────────────
+# Disable dnsmasq (не нужен на VPS без LAN)
 [ -f /usr/sbin/dnsmasq ] && mv /usr/sbin/dnsmasq /usr/sbin/dnsmasq.bak 2>/dev/null || true
 /etc/init.d/dnsmasq disable 2>/dev/null || true
 
-# ── Firewall: разрешить SSH ──────────────────────────────────────────────────
+# Firewall: Allow SSH
 uci add firewall rule
 uci set "firewall.@rule[-1].name=Allow-VPS-SSH"
 uci set "firewall.@rule[-1].src=wan"
@@ -163,7 +197,7 @@ uci set "firewall.@rule[-1].dest_port=${SSH_PORT}"
 uci set "firewall.@rule[-1].proto=tcp"
 uci set "firewall.@rule[-1].target=ACCEPT"
 
-# ── Firewall: разрешить LuCI ─────────────────────────────────────────────────
+# Firewall: Allow LuCI
 uci add firewall rule
 uci set "firewall.@rule[-1].name=Allow-VPS-LuCI"
 uci set "firewall.@rule[-1].src=wan"
@@ -204,9 +238,8 @@ config interface 'wan'
     option gateway '${WAN_GW}'
 EOF
 
-# ── Пароль root (SHA-512 хеш) ─────────────────────────────────────────────────
+# ── Пароль root ───────────────────────────────────────────────────────────────
 if [ -f "$MNT/etc/shadow" ]; then
-    # Экранируем спецсимволы в хеше для sed
     ESCAPED_HASH=$(printf '%s\n' "$PASS_HASH" | sed 's/[\/&$]/\\&/g')
     sed -i "s|^root:[^:]*:|root:${ESCAPED_HASH}:|" "$MNT/etc/shadow"
     msg "Password hash written to /etc/shadow"
@@ -223,9 +256,9 @@ gzip -cq "$OWRT_TMP" > "$OWRT_GZ"
 rm -f "$OWRT_TMP"
 msg "Compressed: $(du -sh "$OWRT_GZ" | cut -f1)"
 
-# ─── Initramfs hook: копируем образ в RAM ────────────────────────────────────
+# ─── Initramfs hook ───────────────────────────────────────────────────────────
 msg "Preparing initramfs hook..."
-cat > /etc/initramfs-tools/hooks/owrt_image << 'EOF'
+cat > /etc/initramfs-tools/hooks/owrt_image << 'HOOK_EOF'
 #!/bin/sh
 [ "$1" = "prereqs" ] && echo "" && exit 0
 . /usr/share/initramfs-tools/hook-functions
@@ -233,17 +266,15 @@ copy_file raw /tmp/owrt.img.gz /owrt.img.gz
 copy_exec /bin/gzip
 copy_exec /bin/dd
 copy_exec /bin/lsblk
-EOF
+HOOK_EOF
 chmod +x /etc/initramfs-tools/hooks/owrt_image
 
-# ─── Initramfs script: записываем образ поверх диска ─────────────────────────
+# ─── Initramfs takeover script ────────────────────────────────────────────────
 msg "Preparing initramfs takeover script..."
-cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'EOF'
+cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'TAKEOVER_EOF'
 #!/bin/sh
 [ "$1" = "prereqs" ] && exit 0
-# Ждём инициализации дисков
 sleep 5
-# Определяем первый диск (не loop, не ram)
 T_DISK=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | head -n1)
 [ -z "$T_DISK" ] && echo "[takeover] ERROR: no disk found" && exit 1
 echo "[takeover] Writing OpenWRT to $T_DISK ..."
@@ -251,17 +282,16 @@ gzip -dcq /owrt.img.gz 2>/dev/null | dd of="$T_DISK" bs=4M status=none conv=fsyn
 sync
 echo "[takeover] Done. Rebooting..."
 reboot -f
-EOF
+TAKEOVER_EOF
 chmod +x /etc/initramfs-tools/scripts/init-premount/takeover
 
-# ─── Пересобираем initramfs ───────────────────────────────────────────────────
+# ─── Rebuild initramfs ────────────────────────────────────────────────────────
 msg "Rebuilding initramfs (this may take ~30s)..."
-# Обновляем initramfs для текущего активного ядра
 CURRENT_KERNEL=$(uname -r)
 update-initramfs -u -k "$CURRENT_KERNEL" 2>&1 | tail -5
 msg "Initramfs updated for kernel $CURRENT_KERNEL."
 
-# ─── Финальный вывод ─────────────────────────────────────────────────────────
+# ─── Final output ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${G}════════════════════════════════════════════════${N}"
 echo -e "${G}  OpenWRT ${LATEST_VER} Install Ready — SAVE THIS!  ${N}"
