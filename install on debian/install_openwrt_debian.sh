@@ -50,7 +50,6 @@ SSH_PORT=${INPUT_SSH_PORT:-$(shuf -i 10000-59999 -n1)}
 ask "LuCI web UI port [random]: "
 read_tty INPUT_LUCI_PORT
 LUCI_PORT=${INPUT_LUCI_PORT:-$(shuf -i 10000-59999 -n1)}
-# Избегаем совпадения портов (числовое сравнение после присвоения дефолта)
 while [ "$LUCI_PORT" -eq "$SSH_PORT" ] 2>/dev/null; do
     LUCI_PORT=$(shuf -i 10000-59999 -n1)
 done
@@ -266,6 +265,21 @@ MNT="/tmp/owrt_mod/rootfs"
 mkdir -p "$MNT"
 mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
 mount -o loop,offset="$OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs."
+
+# ── Патчим GRUB: добавляем console=tty0 для видимости через VNC/KVM
+# OpenWRT x86 по умолчанию выводит только на ttyS0 (serial), VNC провайдеров показывает VGA (tty0)
+GRUB_CFG="$MNT/boot/grub/grub.cfg"
+if [ -f "$GRUB_CFG" ]; then
+    # Добавляем console=tty0 перед console=ttyS0 если ещё не добавлен
+    if ! grep -q 'console=tty0' "$GRUB_CFG"; then
+        sed -i 's/console=ttyS0/console=tty0 console=ttyS0/g' "$GRUB_CFG"
+        msg "GRUB patched: added console=tty0 (VNC/KVM visibility)"
+    else
+        msg "GRUB already has console=tty0, skipping."
+    fi
+else
+    warn "grub.cfg not found at $GRUB_CFG — GRUB patch skipped."
+fi
 
 # ── Хеш пароля SHA-512
 PASS_SALT=$(openssl rand -hex 8)
@@ -512,6 +526,7 @@ HOOK_EOF
 chmod +x /etc/initramfs-tools/hooks/owrt_image
 
 # ─── Initramfs takeover script
+# dd с status=progress — видно в VNC что происходит во время записи
 msg "Preparing initramfs takeover script..."
 cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'TAKEOVER_EOF'
 #!/bin/sh
@@ -520,7 +535,7 @@ sleep 5
 T_DISK=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | head -n1)
 [ -z "$T_DISK" ] && echo "[takeover] ERROR: no disk found" && exit 1
 echo "[takeover] Writing OpenWRT to $T_DISK ..."
-gzip -dcq /owrt.img.gz 2>/dev/null | dd of="$T_DISK" bs=4M status=none conv=fsync
+gzip -dcq /owrt.img.gz 2>/dev/null | dd of="$T_DISK" bs=4M status=progress conv=fsync
 sync
 echo "[takeover] Done. Rebooting..."
 reboot -f
