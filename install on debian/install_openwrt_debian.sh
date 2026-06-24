@@ -15,6 +15,9 @@ err()    { echo -e "${R}[!] ERROR:${N} $1"; exit 1; }
 section(){ echo -e "\n${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; echo -e "${B}  $1${N}"; echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
 ask()    { echo -e "${C}[?]${N} $1"; }
 
+# fdisk, modprobe, losetup живут в /sbin — добавляем в PATH
+export PATH="/sbin:/usr/sbin:$PATH"
+
 read_tty() {
     if [ -t 0 ]; then
         read -r "$1"
@@ -162,36 +165,43 @@ msg "Interface : $ACTIVE_IF"
 msg "WAN IP    : $WAN_IP / $WAN_MASK"
 msg "Gateway   : $WAN_GW"
 
-# ─── Detect latest OpenWRT version ─────────────────────────────────────────────
+# ─── Detect latest OpenWRT version ───────────────────────────────────────────
 msg "Detecting latest OpenWRT stable version..."
 OWRT_BASE="https://downloads.openwrt.org/releases"
+# grep -oP не работает на HTML этого сайта — используем grep -o
+# Фильтруем только версии >= 21.xx чтобы исключить старые ветки (17/18/19)
+# sort -V = версионная сортировка (не лексикографическая)
 LATEST_VER=$(curl -sSL --connect-timeout 15 "${OWRT_BASE}/" 2>/dev/null \
-    | grep -oP '(?<=>)\d+\.\d+\.\d+(?=/)' | sort -V | tail -n1)
+    | grep -o '[0-9][0-9]\.[0-9][0-9]*\.[0-9][0-9]*' \
+    | grep -E '^(2[1-9]|[3-9][0-9])\.' \
+    | sort -V \
+    | tail -n1)
 [ -z "$LATEST_VER" ] && warn "Auto-detection failed, using 25.12.4" && LATEST_VER="25.12.4"
 msg "Detected OpenWRT version: $LATEST_VER"
 
 # ─── Find image ──────────────────────────────────────────────────────────────
 TARGET_URL="${OWRT_BASE}/${LATEST_VER}/targets/x86/64"
 SHA256_URL="${TARGET_URL}/sha256sums"
-msg "Fetching file list..."
+msg "Fetching file list from ${TARGET_URL}..."
 SHA256_LIST=$(curl -sSL --connect-timeout 15 "$SHA256_URL" 2>/dev/null)
 [ -z "$SHA256_LIST" ] && err "Cannot fetch sha256sums from ${SHA256_URL}"
-IMG_NAME=$(echo "$SHA256_LIST" | grep -oP 'openwrt-[\d.]+-x86-64-generic-ext4-combined\.img\.gz' | head -n1)
-[ -z "$IMG_NAME" ] && IMG_NAME=$(echo "$SHA256_LIST" | grep -oP 'openwrt-[\d.]+-x86-64-generic-ext4-combined-efi\.img\.gz' | head -n1)
+IMG_NAME=$(echo "$SHA256_LIST" | grep -o 'openwrt-[^ ]*ext4-combined\.img\.gz' | head -1)
+[ -z "$IMG_NAME" ] && IMG_NAME=$(echo "$SHA256_LIST" | grep -o 'openwrt-[^ ]*ext4-combined-efi\.img\.gz' | head -1)
 [ -z "$IMG_NAME" ] && err "Cannot find ext4-combined image."
 IMG_URL="${TARGET_URL}/${IMG_NAME}"
 IMG_SHA256=$(echo "$SHA256_LIST" | grep "$IMG_NAME" | awk '{print $1}')
-msg "Image : $IMG_NAME"
+msg "Image     : $IMG_NAME"
+msg "Image URL : $IMG_URL"
 
 # ─── Download ────────────────────────────────────────────────────────────────
-msg "Downloading OpenWRT ${LATEST_VER}..."
+msg "Downloading OpenWRT ${LATEST_VER} image..."
 OWRT_TMP="/tmp/owrt.img"
 OWRT_GZ="/tmp/owrt.img.gz"
 curl -L --progress-bar --connect-timeout 30 --retry 3 "$IMG_URL" -o "$OWRT_GZ" || err "Download failed."
 [ ! -s "$OWRT_GZ" ] && err "Downloaded file is empty."
 msg "Downloaded: $(du -sh "$OWRT_GZ" | cut -f1)"
 
-# ─── SHA256 ────────────────────────────────────────────────────────────────────
+# ─── SHA256 ──────────────────────────────────────────────────────────────────
 if [ -n "$IMG_SHA256" ]; then
     msg "Verifying SHA256..."
     ACTUAL=$(sha256sum "$OWRT_GZ" | awk '{print $1}')
@@ -205,28 +215,25 @@ gzip -dcq "$OWRT_GZ" > "$OWRT_TMP" || err "Decompression failed."
 [ ! -s "$OWRT_TMP" ] && err "Decompressed image is empty."
 msg "Decompressed: $(du -sh "$OWRT_TMP" | cut -f1)"
 
-# ─── Patch rootfs ────────────────────────────────────────────────────────────
+# ─── Patch ───────────────────────────────────────────────────────────────────
 section "Патчинг rootfs"
 modprobe loop >/dev/null 2>&1 || true
-OFFSET=$(fdisk -l "$OWRT_TMP" -o Start,Type 2>/dev/null | grep -i "linux" | tail -n1 | awk '{print $1 * 512}')
-[ -z "$OFFSET" ] && err "Cannot detect Linux partition offset."
+
+# Образ OpenWRT x86 имеет два раздела, оба Linux:
+#   p1 (offset 512*512=262144)  — boot раздел: /boot/grub/grub.cfg, vmlinuz
+#   p2 (offset 33792*512)       — rootfs: /etc, /usr, ...
+# Патчим rootfs (p2) — uci-defaults, network, shadow
+ROOTFS_OFFSET=$(fdisk -l "$OWRT_TMP" -o Start,Type 2>/dev/null \
+    | grep -i linux | tail -n1 | awk '{print $1 * 512}')
+[ -z "$ROOTFS_OFFSET" ] && err "Cannot detect rootfs partition offset."
+msg "Rootfs partition offset: ${ROOTFS_OFFSET} bytes"
+
 MNT="/tmp/owrt_mod/rootfs"
 mkdir -p "$MNT"
 mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
-mount -o loop,offset="$OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs."
+mount -o loop,offset="$ROOTFS_OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs."
 
-# ── GRUB: добавляем console=tty0 для VNC/KVM
-GRUB_CFG="$MNT/boot/grub/grub.cfg"
-if [ -f "$GRUB_CFG" ]; then
-    if ! grep -q 'console=tty0' "$GRUB_CFG"; then
-        sed -i 's/console=ttyS0/console=tty0 console=ttyS0/g' "$GRUB_CFG"
-        msg "GRUB patched: added console=tty0 (VNC/KVM)"
-    fi
-else
-    warn "grub.cfg not found — GRUB patch skipped."
-fi
-
-# ── Пароль
+# Пароль
 PASS_SALT=$(openssl rand -hex 8)
 PASS_HASH=$(openssl passwd -6 -salt "$PASS_SALT" "$PASS_RAW")
 mkdir -p "$MNT/etc/uci-defaults"
@@ -396,15 +403,15 @@ else
 fi
 
 umount "$MNT"
-msg "Rootfs patched."
+msg "Rootfs patched successfully."
 
-# ─── Recompress ────────────────────────────────────────────────────────────
+# ─── Recompress ──────────────────────────────────────────────────────────────
 msg "Compressing patched image..."
 gzip -cq "$OWRT_TMP" > "$OWRT_GZ"
 rm -f "$OWRT_TMP"
 msg "Compressed: $(du -sh "$OWRT_GZ" | cut -f1)"
 
-# ─── Initramfs hook ───────────────────────────────────────────────────────────
+# ─── Initramfs hook ──────────────────────────────────────────────────────────
 msg "Preparing initramfs hook..."
 cat > /etc/initramfs-tools/hooks/owrt_image << 'HOOK_EOF'
 #!/bin/sh
@@ -417,8 +424,8 @@ copy_exec /bin/lsblk
 HOOK_EOF
 chmod +x /etc/initramfs-tools/hooks/owrt_image
 
-# ─── Takeover script (busybox-compatible, как в v1) ─────────────────────────────
-msg "Preparing takeover script..."
+# ─── Takeover script (busybox-compatible, как в v1) ──────────────────────────
+msg "Preparing initramfs takeover script..."
 cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'TAKEOVER_EOF'
 #!/bin/sh
 [ "$1" = "prereqs" ] && exit 0
@@ -433,10 +440,10 @@ reboot -f
 TAKEOVER_EOF
 chmod +x /etc/initramfs-tools/scripts/init-premount/takeover
 
-# ─── Rebuild initramfs ───────────────────────────────────────────────────────────
-msg "Rebuilding initramfs..."
+# ─── Rebuild initramfs ───────────────────────────────────────────────────────
+msg "Rebuilding initramfs (this may take ~30s)..."
 update-initramfs -u -k "$(uname -r)" 2>&1 | tail -3
-msg "Initramfs ready."
+msg "Initramfs updated for kernel $(uname -r)."
 
 # ─── Final output ────────────────────────────────────────────────────────────
 echo ""
@@ -453,7 +460,7 @@ echo -e "  Password : ${Y}${PASS_RAW}${N}"
 echo -e "${G}════════════════════════════════════════════════${N}"
 echo ""
 warn "Система перезагрузится через 10 секунд и запишет OpenWRT на диск."
-warn "Текущая SSH-сессия будет обрвана. Это НЕОБРАТИМО!"
+warn "Текущая SSH-сессия будет оборвана. Это НЕОБРАТИМО!"
 echo ""
 sleep 10
 reboot -f
