@@ -270,7 +270,6 @@ mount -o loop,offset="$OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs
 # OpenWRT x86 по умолчанию выводит только на ttyS0 (serial), VNC провайдеров показывает VGA (tty0)
 GRUB_CFG="$MNT/boot/grub/grub.cfg"
 if [ -f "$GRUB_CFG" ]; then
-    # Добавляем console=tty0 перед console=ttyS0 если ещё не добавлен
     if ! grep -q 'console=tty0' "$GRUB_CFG"; then
         sed -i 's/console=ttyS0/console=tty0 console=ttyS0/g' "$GRUB_CFG"
         msg "GRUB patched: added console=tty0 (VNC/KVM visibility)"
@@ -526,16 +525,26 @@ HOOK_EOF
 chmod +x /etc/initramfs-tools/hooks/owrt_image
 
 # ─── Initramfs takeover script
-# dd с status=progress — видно в VNC что происходит во время записи
+# ВАЖНО: busybox dd в initramfs НЕ поддерживает status=progress — убрано
+# Guard: если OpenWRT уже записан (magic bytes GRUB), такeover не запускается повторно
 msg "Preparing initramfs takeover script..."
 cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'TAKEOVER_EOF'
 #!/bin/sh
 [ "$1" = "prereqs" ] && exit 0
 sleep 5
+
 T_DISK=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | head -n1)
 [ -z "$T_DISK" ] && echo "[takeover] ERROR: no disk found" && exit 1
+
+# Guard: проверяем первые байты диска.
+# Если там уже лежит GRUB (строка "GRUB" в MBR), значит OpenWRT уже записан — пропускаем.
+if dd if="$T_DISK" bs=512 count=1 2>/dev/null | grep -q 'GRUB'; then
+    echo "[takeover] OpenWRT already installed on $T_DISK, skipping write."
+    exit 0
+fi
+
 echo "[takeover] Writing OpenWRT to $T_DISK ..."
-gzip -dcq /owrt.img.gz 2>/dev/null | dd of="$T_DISK" bs=4M status=progress conv=fsync
+gzip -dcq /owrt.img.gz 2>/dev/null | dd of="$T_DISK" bs=4M conv=fsync
 sync
 echo "[takeover] Done. Rebooting..."
 reboot -f
