@@ -212,7 +212,7 @@ IMG_SHA256=$(echo "$SHA256_LIST" | grep "$IMG_NAME" | awk '{print $1}')
 msg "Image     : $IMG_NAME"
 msg "Image URL : $IMG_URL"
 
-# ─── Download ──────────────────────────────────────────────────────────────
+# ─── Download ────────────────────────────────────────────────────────────────
 msg "Downloading OpenWRT ${LATEST_VER} image..."
 OWRT_TMP="/tmp/owrt.img"
 OWRT_GZ="/tmp/owrt.img.gz"
@@ -319,11 +319,12 @@ if [ "$INSTALL_WG" -eq 1 ]; then
     cat > "$MNT/etc/uci-defaults/30_wireguard" << EOF
 #!/bin/sh
 
-# wireguard-tools — утилиты (wg, wg-quick)
+# wireguard-tools  — утилиты wg/wg-quick, генерация ключей
 # luci-proto-wireguard — поддержка протокола в LuCI
-# kmod-wireguard НЕ устанавливается: модуль встроен в ядро OpenWRT 25.x x86_64
+# qrencode         — генерация QR-кода конфига клиента в терминале
+# kmod-wireguard   НЕ устанавливается: встроен в ядро OpenWRT 25.x x86_64
 apk update
-apk add wireguard-tools luci-proto-wireguard
+apk add wireguard-tools luci-proto-wireguard qrencode
 
 mkdir -p /etc/wireguard
 wg genkey > /etc/wireguard/server.key
