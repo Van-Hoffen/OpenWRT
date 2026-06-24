@@ -12,6 +12,7 @@
 | Хостовая ОС | Debian 11 / 12 / 13 (x86_64) |
 | Права | root |
 | Архитектура | x86_64 |
+| Тип виртуализации | KVM (ОпенВЗ / LXC не поддерживаются) |
 | RAM | от 256 МБ |
 | Диск | от 512 МБ |
 | Сеть | Статический IP на VPS (рекомендуется) |
@@ -22,17 +23,22 @@
 
 ## Использование
 
+> ⚠️ **Важно**: используйте только `curl` для скачивания скрипта. `wget` может отдавать устаревшую версию из-за кеширования GitHub CDN.
+
 ### Базовый запуск
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/Van-Hoffen/OpenWRT/main/install%20on%20debian/install_openwrt_debian.sh
-chmod +x install.sh
-bash install.sh
+curl -sSL -H 'Cache-Control: no-cache' \
+  https://raw.githubusercontent.com/Van-Hoffen/OpenWRT/main/install%20on%20debian/install_openwrt_debian.sh \
+  -o install.sh && bash install.sh
 ```
 
 ### С заданными параметрами (опционально)
 
 ```bash
+curl -sSL -H 'Cache-Control: no-cache' \
+  https://raw.githubusercontent.com/Van-Hoffen/OpenWRT/main/install%20on%20debian/install_openwrt_debian.sh \
+  -o install.sh
 SSH_PORT=2222 LUCI_PORT=8080 SSH_PASS=MyPassword bash install.sh
 ```
 
@@ -49,22 +55,21 @@ SSH_PORT=2222 LUCI_PORT=8080 SSH_PASS=MyPassword bash install.sh
 ## Что делает скрипт
 
 1. **Определяет сеть** — IP-адрес, маску, шлюз на активном интерфейсе
-2. **Авто-определяет последнюю стабильную версию OpenWRT** — парсит `downloads.openwrt.org`
-3. **Скачивает образ** `openwrt-*-x86-64-generic-ext4-combined.img.gz`
-4. **Монтирует rootfs образа** и патчит его:
+2. **Устанавливает зависимости** — `curl`, `gzip`, `fdisk`, `openssl` и др.
+3. **Авто-определяет последнюю стабильную версию OpenWRT** — через `sha256sums` файл на сервере OpenWRT
+4. **Скачивает образ** `openwrt-*-x86-64-generic-ext4-combined.img.gz` и проверяет SHA256
+5. **Монтирует rootfs образа** и патчит его:
    - Прописывает статическую WAN-конфигурацию
    - Устанавливает случайные порты SSH (dropbear) и LuCI (uhttpd)
    - Добавляет правила firewall для этих портов
    - Устанавливает хеш пароля root (SHA-512)
    - Отключает dnsmasq (не нужен на VPS без LAN)
-5. **Собирает initramfs** с образом внутри
-6. **Перезагружает сервер** — при старте initramfs записывает образ на диск через `dd` и снова перезагружается уже в OpenWRT
+6. **Собирает initramfs** с образом внутри
+7. **Перезагружает сервер** — при старте initramfs записывает образ на диск через `dd` и снова перезагружается уже в OpenWRT
 
 ---
 
 ## Вывод перед перезагрузкой
-
-Перед запуском скрипт покажет и продублирует итоговую таблицу доступа:
 
 ```
 ════════════════════════════════════════════════
@@ -123,13 +128,20 @@ apk upgrade
 
 Скрипт использует `openssl passwd -6` (SHA-512) — формат совместим с busybox/shadow в OpenWRT 21.02+.
 
-### Автоматическое определение версии
+### Автоматическое определение версии и проверка образа
+
+Скрипт скачивает `sha256sums` с сервера OpenWRT, извлекает имя файла и контрольную сумму автоматически:
 
 ```bash
-LATEST_VER=$(curl .../releases/ | grep -oP версии | sort -V | tail -n1)
+# Получаем список файлов и хеши
+SHA256_LIST=$(curl .../releases/25.12.4/targets/x86/64/sha256sums)
+# Извлекаем имя образа
+IMG_NAME=$(echo "$SHA256_LIST" | grep -oP 'openwrt-...-ext4-combined\.img\.gz')
+# После скачивания — проверяем SHA256
+sha256sum owrt.img.gz | сравниваем с извлечённым хешем
 ```
 
-Если парсинг не удался — используется fallback на последнюю известную версию (`25.12.4`).  
+Если авто-детект не удался — используется fallback на последнюю известную версию (`25.12.4`).  
 Также предусмотрен fallback на `-efi` вариант образа если стандартный недоступен.
 
 ### Механизм takeover
@@ -149,8 +161,9 @@ gzip -dcq /owrt.img.gz | dd of=/dev/sda bs=4M conv=fsync
 - Работает только с **одним сетевым интерфейсом** (WAN = `eth0`)
 - После установки **LAN-интерфейс** (`br-lan`) настроен на VLAN `eth0.10` — на большинстве VPS он не используется
 - **HTTPS для LuCI** не настраивается автоматически — порт настроен только для HTTP
-- Протестировано на провайдерах с **virtio-net** (KVM-VPS); на XEN/OpenVZ могут потребоваться правки сетевого интерфейса
+- Протестировано на провайдерах с **virtio-net** (KVM-VPS); на XEN могут потребоваться правки сетевого интерфейса
 - **dnsmasq отключён** — после установки требуется ручная настройка DNS (см. раздел выше)
+- **Скачивайте скрипт только через `curl`** — `wget` может отдавать устаревшую версию из-за кеширования GitHub CDN
 
 ---
 
@@ -159,7 +172,6 @@ gzip -dcq /owrt.img.gz | dd of=/dev/sda bs=4M conv=fsync
 ```
 install on debian/
 ├── install_openwrt_debian.sh   # Основной скрипт установки
-├── install_v1.sh               # Оригинальный скрипт с habr.
 └── README.md                   # Этот файл
 ```
 
