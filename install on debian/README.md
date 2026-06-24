@@ -159,6 +159,7 @@ gzip -dcq /owrt.img.gz | dd of=/dev/sda bs=4M conv=fsync
 ```
 install on debian/
 ├── install_openwrt_debian.sh   # Основной скрипт установки
+├── install_v1.sh               # Оригинальный скрипт с habr.
 └── README.md                   # Этот файл
 ```
 
