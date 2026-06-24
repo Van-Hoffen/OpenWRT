@@ -40,7 +40,7 @@ apt-get install -y curl gzip util-linux fdisk initramfs-tools openssl kmod >/dev
 
 # 3. Image Preparation
 msg "Downloading OpenWRT image..."
-URL="https://downloads.openwrt.org/releases/23.05.0/targets/x86/64/openwrt-23.05.0-x86-64-generic-ext4-combined.img.gz"
+URL="https://downloads.openwrt.org/releases/25.12.4/targets/x86/64/openwrt-25.12.4-x86-64-generic-ext4-combined.img.gz"
 curl -L "$URL" -s | gzip -dcq > /tmp/owrt.img 2>/dev/null || true
 [ ! -s /tmp/owrt.img ] && err "Image download failed."
 
