@@ -68,7 +68,6 @@ if echo "$YN" | grep -qiE "^y(es)?$"; then
     ask "WireGuard internal network [10.8.0.0/24]: "
     read -r INPUT_WG_NET
     WG_NET=${INPUT_WG_NET:-10.8.0.0/24}
-    # Адрес сервера — первый хост в сети
     WG_SERVER_IP=$(echo "$WG_NET" | sed 's|\([0-9]*\.[0-9]*\.[0-9]*\)\.[0-9]*/.*|\1.1|')
     WG_PREFIX=$(echo "$WG_NET" | cut -d/ -f2)
 
@@ -111,7 +110,6 @@ if echo "$YN" | grep -qiE "^y(es)?$"; then
     echo ""
     msg "Списки для обхода: ${Y}${PODKOP_LISTS}${N}"
 
-    # DNS для PODKOP
     ask "DNS для PODKOP — doh (рекомендуется) или plain [doh]: "
     read -r PODKOP_DNS_TYPE
     PODKOP_DNS_TYPE=${PODKOP_DNS_TYPE:-doh}
@@ -214,7 +212,7 @@ IMG_SHA256=$(echo "$SHA256_LIST" | grep "$IMG_NAME" | awk '{print $1}')
 msg "Image     : $IMG_NAME"
 msg "Image URL : $IMG_URL"
 
-# ─── Download ────────────────────────────────────────────────────────────────
+# ─── Download ──────────────────────────────────────────────────────────────
 msg "Downloading OpenWRT ${LATEST_VER} image..."
 OWRT_TMP="/tmp/owrt.img"
 OWRT_GZ="/tmp/owrt.img.gz"
@@ -258,16 +256,15 @@ mkdir -p "$MNT"
 mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
 mount -o loop,offset="$OFFSET" "$OWRT_TMP" "$MNT" || err "Failed to mount rootfs."
 
-# ── Хеш пароля SHA-512 ────────────────────────────────────────────────────────
+# ── Хеш пароля SHA-512
 PASS_SALT=$(openssl rand -hex 8)
 PASS_HASH=$(openssl passwd -6 -salt "$PASS_SALT" "$PASS_RAW")
 
 mkdir -p "$MNT/etc/uci-defaults"
 
-# ── 10_dns_fix — ПЕРВЫМ, нужен для всех следующих скриптов ───────────────────
+# ── 10_dns_fix — ПЕРВЫМ, нужен для всех следующих скриптов
 cat > "$MNT/etc/uci-defaults/10_dns_fix" << 'EOF'
 #!/bin/sh
-# Отключаем dnsmasq, прописываем реальные DNS
 [ -f /usr/sbin/dnsmasq ] && mv /usr/sbin/dnsmasq /usr/sbin/dnsmasq.bak 2>/dev/null || true
 /etc/init.d/dnsmasq disable 2>/dev/null || true
 
@@ -281,24 +278,21 @@ exit 0
 EOF
 chmod +x "$MNT/etc/uci-defaults/10_dns_fix"
 
-# ── 20_vps_base — SSH, LuCI, Firewall ────────────────────────────────────────
+# ── 20_vps_base — SSH, LuCI, Firewall
 cat > "$MNT/etc/uci-defaults/20_vps_base" << EOF
 #!/bin/sh
 
-# SSH (dropbear)
 uci set dropbear.@dropbear[0].Port='${SSH_PORT}'
 uci set dropbear.@dropbear[0].PasswordAuth='on'
 uci set dropbear.@dropbear[0].RootPasswordAuth='on'
 uci commit dropbear
 
-# LuCI HTTP (uhttpd)
 uci del uhttpd.main.listen_http  2>/dev/null || true
 uci del uhttpd.main.listen_https 2>/dev/null || true
 uci add_list uhttpd.main.listen_http='0.0.0.0:${LUCI_PORT}'
 uci add_list uhttpd.main.listen_http='[::]:${LUCI_PORT}'
 uci commit uhttpd
 
-# Firewall: Allow SSH
 uci add firewall rule
 uci set "firewall.@rule[-1].name=Allow-VPS-SSH"
 uci set "firewall.@rule[-1].src=wan"
@@ -306,7 +300,6 @@ uci set "firewall.@rule[-1].dest_port=${SSH_PORT}"
 uci set "firewall.@rule[-1].proto=tcp"
 uci set "firewall.@rule[-1].target=ACCEPT"
 
-# Firewall: Allow LuCI
 uci add firewall rule
 uci set "firewall.@rule[-1].name=Allow-VPS-LuCI"
 uci set "firewall.@rule[-1].src=wan"
@@ -320,17 +313,18 @@ exit 0
 EOF
 chmod +x "$MNT/etc/uci-defaults/20_vps_base"
 
-# ── 30_wireguard — если выбрана установка ────────────────────────────────────
+# ── 30_wireguard — если выбрана установка
 if [ "$INSTALL_WG" -eq 1 ]; then
     msg "Preparing WireGuard UCI defaults..."
     cat > "$MNT/etc/uci-defaults/30_wireguard" << EOF
 #!/bin/sh
 
-# Установка пакетов WireGuard
+# wireguard-tools — утилиты (wg, wg-quick)
+# luci-proto-wireguard — поддержка протокола в LuCI
+# kmod-wireguard НЕ устанавливается: модуль встроен в ядро OpenWRT 25.x x86_64
 apk update
-apk add wireguard-tools luci-proto-wireguard kmod-wireguard
+apk add wireguard-tools luci-proto-wireguard
 
-# Генерация ключей сервера
 mkdir -p /etc/wireguard
 wg genkey > /etc/wireguard/server.key
 chmod 600 /etc/wireguard/server.key
@@ -338,7 +332,6 @@ wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
 
 SERVER_PRIVKEY=\$(cat /etc/wireguard/server.key)
 
-# Сетевой интерфейс wg0
 uci set network.wg0='interface'
 uci set network.wg0.proto='wireguard'
 uci set network.wg0.private_key="\${SERVER_PRIVKEY}"
@@ -346,15 +339,12 @@ uci set network.wg0.listen_port='${WG_PORT}'
 uci add_list network.wg0.addresses='${WG_SERVER_IP}/${WG_PREFIX}'
 uci commit network
 
-# Удаляем приватный ключ из UCI (хранится в /etc/wireguard/server.key)
 uci delete network.wg0.private_key 2>/dev/null || true
 uci commit network
 
-# Добавляем wg0 в зону lan
 uci add_list firewall.@zone[0].network='wg0'
 uci commit firewall
 
-# Firewall: разрешить WireGuard UDP
 uci add firewall rule
 uci set "firewall.@rule[-1].name=Allow-WireGuard"
 uci set "firewall.@rule[-1].src=wan"
@@ -363,7 +353,6 @@ uci set "firewall.@rule[-1].proto=udp"
 uci set "firewall.@rule[-1].target=ACCEPT"
 uci commit firewall
 
-# Публичный ключ сервера — сохраняем в /etc/banner для удобства
 SERVER_PUBKEY=\$(cat /etc/wireguard/server.pub)
 echo "" >> /etc/banner
 echo "=== WireGuard Server Public Key ===" >> /etc/banner
@@ -376,20 +365,17 @@ EOF
     msg "WireGuard UCI defaults: OK"
 fi
 
-# ── 40_podkop — если выбрана установка ───────────────────────────────────────
+# ── 40_podkop — если выбрана установка
 if [ "$INSTALL_PODKOP" -eq 1 ]; then
     msg "Preparing PODKOP UCI defaults..."
 
-    # Экранируем VLESS URL для безопасной записи
     VLESS_ESCAPED=$(printf '%s' "$VLESS_URL" | sed "s/'/'\\\\''/g")
 
-    # Формируем строки uci add_list для выбранных списков
     LISTS_UCI=""
     for L in $PODKOP_LISTS; do
         LISTS_UCI="${LISTS_UCI}\nuci add_list podkop.settings.community_lists='${L}'"
     done
 
-    # VLESS UCI строка
     if [ -n "$VLESS_URL" ]; then
         VLESS_UCI="uci set podkop.main.proxy_string='${VLESS_ESCAPED}'"
     else
@@ -399,11 +385,9 @@ if [ "$INSTALL_PODKOP" -eq 1 ]; then
     cat > "$MNT/etc/uci-defaults/40_podkop" << EOF
 #!/bin/sh
 
-# Создаём /tmp/sing-box (tmpfs — нужно при каждом старте)
 mkdir -p /tmp/sing-box
 chmod 755 /tmp/sing-box
 
-# init.d скрипт для пересоздания /tmp/sing-box при каждой загрузке
 cat > /etc/init.d/singbox-tmpdir << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=19
@@ -415,13 +399,10 @@ INITEOF
 chmod +x /etc/init.d/singbox-tmpdir
 /etc/init.d/singbox-tmpdir enable
 
-# Установка PODKOP через официальный инсталлятор
 sh \$(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)
 
-# Пауза для применения
 sleep 3
 
-# UCI конфигурация PODKOP
 uci set podkop.settings='settings'
 uci set podkop.settings.dns_type='${PODKOP_DNS_TYPE}'
 uci set podkop.settings.dns_server='dns.adguard-dns.com'
@@ -435,25 +416,21 @@ uci set podkop.settings.update_interval='1d'
 uci add_list podkop.settings.source_network_interfaces='br-lan'
 EOF
 
-    # Добавляем wg0 в source_interfaces только если WG включён
     if [ "$INSTALL_WG" -eq 1 ]; then
         echo "uci add_list podkop.settings.source_network_interfaces='wg0'" >> "$MNT/etc/uci-defaults/40_podkop"
     fi
 
     cat >> "$MNT/etc/uci-defaults/40_podkop" << EOF
 
-# Секция main — VLESS
 uci set podkop.main='section'
 uci set podkop.main.connection_type='proxy'
 uci set podkop.main.proxy_config_type='url'
 ${VLESS_UCI}
 
-# Списки обхода блокировок
 ${LISTS_UCI}
 
 uci commit podkop
 
-# Автозапуск PODKOP
 /etc/init.d/podkop enable
 
 exit 0
@@ -462,7 +439,7 @@ EOF
     msg "PODKOP UCI defaults: OK"
 fi
 
-# ── Сетевая конфигурация ──────────────────────────────────────────────────────
+# ── Сетевая конфигурация
 cat > "$MNT/etc/config/network" << EOF
 config interface 'loopback'
     option device 'lo'
@@ -491,7 +468,7 @@ config interface 'wan'
     option dns '1.1.1.1 8.8.8.8'
 EOF
 
-# ── Пароль root ───────────────────────────────────────────────────────────────
+# ── Пароль root
 if [ -f "$MNT/etc/shadow" ]; then
     ESCAPED_HASH=$(printf '%s\n' "$PASS_HASH" | sed 's/[\/&$]/\\&/g')
     sed -i "s|^root:[^:]*:|root:${ESCAPED_HASH}:|" "$MNT/etc/shadow"
@@ -503,13 +480,13 @@ fi
 umount "$MNT"
 msg "Rootfs patched successfully."
 
-# ─── Compress patched image ───────────────────────────────────────────────────
+# ─── Compress patched image
 msg "Compressing patched image..."
 gzip -cq "$OWRT_TMP" > "$OWRT_GZ"
 rm -f "$OWRT_TMP"
 msg "Compressed: $(du -sh "$OWRT_GZ" | cut -f1)"
 
-# ─── Initramfs hook ───────────────────────────────────────────────────────────
+# ─── Initramfs hook
 msg "Preparing initramfs hook..."
 cat > /etc/initramfs-tools/hooks/owrt_image << 'HOOK_EOF'
 #!/bin/sh
@@ -522,7 +499,7 @@ copy_exec /bin/lsblk
 HOOK_EOF
 chmod +x /etc/initramfs-tools/hooks/owrt_image
 
-# ─── Initramfs takeover script ────────────────────────────────────────────────
+# ─── Initramfs takeover script
 msg "Preparing initramfs takeover script..."
 cat > /etc/initramfs-tools/scripts/init-premount/takeover << 'TAKEOVER_EOF'
 #!/bin/sh
@@ -538,13 +515,13 @@ reboot -f
 TAKEOVER_EOF
 chmod +x /etc/initramfs-tools/scripts/init-premount/takeover
 
-# ─── Rebuild initramfs ────────────────────────────────────────────────────────
+# ─── Rebuild initramfs
 msg "Rebuilding initramfs (this may take ~30s)..."
 CURRENT_KERNEL=$(uname -r)
 update-initramfs -u -k "$CURRENT_KERNEL" 2>&1 | tail -5
 msg "Initramfs updated for kernel $CURRENT_KERNEL."
 
-# ─── Final output ─────────────────────────────────────────────────────────────
+# ─── Final output
 echo ""
 echo -e "${G}════════════════════════════════════════════════${N}"
 echo -e "${G}  OpenWRT ${LATEST_VER} Install Ready — SAVE THIS!  ${N}"
