@@ -15,6 +15,15 @@ err()    { echo -e "${R}[!] ERROR:${N} $1"; exit 1; }
 section(){ echo -e "\n${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; echo -e "${B}  $1${N}"; echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
 ask()    { echo -e "${C}[?]${N} $1"; }
 
+# read_tty: работает и при wget|bash (stdin = pipe), и при bash script.sh
+read_tty() {
+    if [ -t 0 ]; then
+        read -r "$1"
+    else
+        read -r "$1" < /dev/tty
+    fi
+}
+
 # ─── Sanity checks ───────────────────────────────────────────────────────────
 [ "$(id -u)" -ne 0 ] && err "Must run as root."
 [ "$(uname -m)" != "x86_64" ] && err "Only x86_64 is supported."
@@ -23,25 +32,32 @@ if systemd-detect-virt 2>/dev/null | grep -qiE "openvz|lxc"; then
     err "OpenVZ/LXC is not supported. Use a KVM-based VPS."
 fi
 
+# ─── Early dependencies (curl может отсутствовать на Debian 13) ───────────────
+msg "Installing base dependencies (curl, openssl, etc.)..."
+apt-get update -y >/dev/null 2>&1
+apt-get install -y curl gzip util-linux fdisk initramfs-tools openssl kmod >/dev/null 2>&1
+msg "Dependencies installed."
+
 # ─── Interactive setup ───────────────────────────────────────────────────────
 section "OpenWRT VPS Installer — Interactive Setup"
 
 # SSH Port
 ask "SSH port [random]: "
-read -r INPUT_SSH_PORT
+read_tty INPUT_SSH_PORT
 SSH_PORT=${INPUT_SSH_PORT:-$(shuf -i 10000-59999 -n1)}
 
 # LuCI Port
 ask "LuCI web UI port [random]: "
-read -r INPUT_LUCI_PORT
+read_tty INPUT_LUCI_PORT
 LUCI_PORT=${INPUT_LUCI_PORT:-$(shuf -i 10000-59999 -n1)}
-while [ "$LUCI_PORT" -eq "$SSH_PORT" ]; do
+# Избегаем совпадения портов (числовое сравнение после присвоения дефолта)
+while [ "$LUCI_PORT" -eq "$SSH_PORT" ] 2>/dev/null; do
     LUCI_PORT=$(shuf -i 10000-59999 -n1)
 done
 
 # Root Password
 ask "Root password [random 16 chars]: "
-read -r INPUT_PASS
+read_tty INPUT_PASS
 PASS_RAW="${INPUT_PASS:-$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)}"
 
 echo ""
@@ -57,16 +73,16 @@ section "WireGuard Server (optional)"
 
 INSTALL_WG=0
 ask "Install WireGuard server? [y/N]: "
-read -r YN
+read_tty YN
 if echo "$YN" | grep -qiE "^y(es)?$"; then
     INSTALL_WG=1
 
     ask "WireGuard listen port [51820]: "
-    read -r INPUT_WG_PORT
+    read_tty INPUT_WG_PORT
     WG_PORT=${INPUT_WG_PORT:-51820}
 
     ask "WireGuard internal network [10.8.0.0/24]: "
-    read -r INPUT_WG_NET
+    read_tty INPUT_WG_NET
     WG_NET=${INPUT_WG_NET:-10.8.0.0/24}
     WG_SERVER_IP=$(echo "$WG_NET" | sed 's|\([0-9]*\.[0-9]*\.[0-9]*\)\.[0-9]*/.*|\1.1|')
     WG_PREFIX=$(echo "$WG_NET" | cut -d/ -f2)
@@ -80,7 +96,7 @@ section "PODKOP + sing-box (optional)"
 
 INSTALL_PODKOP=0
 ask "Install PODKOP (bypass censorship)? [y/N]: "
-read -r YN
+read_tty YN
 if echo "$YN" | grep -qiE "^y(es)?$"; then
     INSTALL_PODKOP=1
 
@@ -90,7 +106,7 @@ if echo "$YN" | grep -qiE "^y(es)?$"; then
     warn "LuCI → Services → Podkop"
     echo ""
     ask "VLESS URL (или Enter для пропуска): "
-    read -r VLESS_URL
+    read_tty VLESS_URL
 
     echo ""
     msg "Выберите списки для обхода блокировок."
@@ -101,7 +117,7 @@ if echo "$YN" | grep -qiE "^y(es)?$"; then
 
     for LIST_NAME in meta telegram twitter discord googleai googleplay; do
         ask "Добавить список '${Y}${LIST_NAME}${N}'? [y/N]: "
-        read -r YN_LIST
+        read_tty YN_LIST
         if echo "$YN_LIST" | grep -qiE "^y(es)?$"; then
             PODKOP_LISTS="${PODKOP_LISTS} ${LIST_NAME}"
         fi
@@ -111,7 +127,7 @@ if echo "$YN" | grep -qiE "^y(es)?$"; then
     msg "Списки для обхода: ${Y}${PODKOP_LISTS}${N}"
 
     ask "DNS для PODKOP — doh (рекомендуется) или plain [doh]: "
-    read -r PODKOP_DNS_TYPE
+    read_tty PODKOP_DNS_TYPE
     PODKOP_DNS_TYPE=${PODKOP_DNS_TYPE:-doh}
 fi
 
@@ -133,7 +149,7 @@ fi
 echo ""
 warn "Система будет НЕОБРАТИМО перезаписана. Все данные на диске уничтожены."
 ask "Продолжить установку? [y/N]: "
-read -r CONFIRM
+read_tty CONFIRM
 echo "$CONFIRM" | grep -qiE "^y(es)?$" || { msg "Отменено."; exit 0; }
 
 # ─── Network Discovery ───────────────────────────────────────────────────────
@@ -165,11 +181,6 @@ WAN_MASK=$(cdr2mask "${WAN_PREFIX:-24}")
 msg "Interface : $ACTIVE_IF"
 msg "WAN IP    : $WAN_IP / $WAN_MASK"
 msg "Gateway   : $WAN_GW"
-
-# ─── Dependencies ────────────────────────────────────────────────────────────
-msg "Installing dependencies..."
-apt-get update -y >/dev/null 2>&1
-apt-get install -y curl gzip util-linux fdisk initramfs-tools openssl kmod >/dev/null 2>&1
 
 # ─── Auto-detect latest OpenWRT version ──────────────────────────────────────
 msg "Detecting latest OpenWRT stable version..."
